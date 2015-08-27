@@ -109,7 +109,11 @@ func (l *localState) ConsulServerUp() {
 // Pause is used to pause state synchronization, this can be
 // used to make batch changes
 func (l *localState) Pause() {
+	// By locking here we ensure that any existing sync is completed
+	// before we pause.
+	l.Lock()
 	atomic.StoreInt32(&l.paused, 1)
+	l.Unlock()
 }
 
 // Resume is used to resume state synchronization
@@ -324,10 +328,6 @@ SYNC:
 		case <-aeTimer:
 			goto SYNC
 		case <-l.triggerCh:
-			// Skip the sync if we are paused
-			if l.isPaused() {
-				continue
-			}
 			if err := l.syncChanges(); err != nil {
 				l.logger.Printf("[ERR] agent: failed to sync changes: %v", err)
 			}
@@ -357,6 +357,12 @@ func (l *localState) setSyncState() error {
 
 	l.Lock()
 	defer l.Unlock()
+
+	// Bail out if we are paused. We protect the pause status with the lock
+	// so that we finish in here before pausing takes effect.
+	if l.isPaused() {
+		return nil
+	}
 
 	services := make(map[string]*structs.NodeService)
 	if out1.NodeServices != nil {
@@ -434,6 +440,12 @@ func (l *localState) setSyncState() error {
 func (l *localState) syncChanges() error {
 	l.Lock()
 	defer l.Unlock()
+
+	// Bail out if we are paused. We protect the pause status with the lock
+	// so that we finish in here before pausing takes effect.
+	if l.isPaused() {
+		return nil
+	}
 
 	// Sync the services
 	for id, status := range l.serviceStatus {
