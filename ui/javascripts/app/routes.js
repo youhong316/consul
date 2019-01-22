@@ -69,7 +69,7 @@ App.BaseRoute = Ember.Route.extend({
 App.IndexRoute = App.BaseRoute.extend({
   // Retrieve the list of datacenters
   model: function(params) {
-    return Ember.$.getJSON('/v1/catalog/datacenters').then(function(data) {
+    return Ember.$.getJSON(consulHost + '/v1/catalog/datacenters').then(function(data) {
       return data;
     });
   },
@@ -88,12 +88,14 @@ App.IndexRoute = App.BaseRoute.extend({
 // functioning, as well as the per-dc requests.
 App.DcRoute = App.BaseRoute.extend({
   model: function(params) {
-    // Return a promise hash to retreieve the
+    var token = App.get('settings.token');
+
+    // Return a promise hash to retrieve the
     // dcs and nodes used in the header
     return Ember.RSVP.hash({
       dc: params.dc,
-      dcs: Ember.$.getJSON('/v1/catalog/datacenters'),
-      nodes: Ember.$.getJSON(formatUrl('/v1/internal/ui/nodes', params.dc)).then(function(data) {
+      dcs: Ember.$.getJSON(consulHost + '/v1/catalog/datacenters'),
+      nodes: Ember.$.getJSON(formatUrl(consulHost + '/v1/internal/ui/nodes', params.dc, token)).then(function(data) {
         var objs = [];
 
         // Merge the nodes into a list and create objects out of them
@@ -102,6 +104,9 @@ App.DcRoute = App.BaseRoute.extend({
         });
 
         return objs;
+      }),
+      coordinates: Ember.$.getJSON(formatUrl(consulHost + '/v1/coordinate/nodes', params.dc, token)).then(function(data) {
+        return data;
       })
     });
   },
@@ -110,6 +115,7 @@ App.DcRoute = App.BaseRoute.extend({
     controller.set('content', models.dc);
     controller.set('nodes', models.nodes);
     controller.set('dcs', models.dcs);
+    controller.set('coordinates', models.coordinates);
     controller.set('isDropdownVisible', false);
   },
 });
@@ -130,7 +136,7 @@ App.KvShowRoute = App.BaseRoute.extend({
     // and the original key requested in params
     return Ember.RSVP.hash({
       key: key,
-      keys: Ember.$.getJSON(formatUrl('/v1/kv/' + key + '?keys&seperator=/', dc, token)).then(function(data) {
+      keys: Ember.$.getJSON(formatUrl(consulHost + '/v1/kv/' + key + '?keys&seperator=/', dc, token)).then(function(data) {
         var objs = [];
         data.map(function(obj){
           objs.push(App.Key.create({Key: obj}));
@@ -165,11 +171,11 @@ App.KvEditRoute = App.BaseRoute.extend({
     return Ember.RSVP.hash({
       dc: dc,
       token: token,
-      key: Ember.$.getJSON(formatUrl('/v1/kv/' + key, dc, token)).then(function(data) {
+      key: Ember.$.getJSON(formatUrl(consulHost + '/v1/kv/' + key, dc, token)).then(function(data) {
         // Convert the returned data to a Key
         return App.Key.create().setProperties(data[0]);
       }),
-      keys: keysPromise = Ember.$.getJSON(formatUrl('/v1/kv/' + parentKeys.parent + '?keys&seperator=/', dc, token)).then(function(data) {
+      keys: keysPromise = Ember.$.getJSON(formatUrl(consulHost + '/v1/kv/' + parentKeys.parent + '?keys&seperator=/', dc, token)).then(function(data) {
         var objs = [];
         data.map(function(obj){
          objs.push(App.Key.create({Key: obj}));
@@ -182,7 +188,7 @@ App.KvEditRoute = App.BaseRoute.extend({
   // Load the session on the key, if there is one
   afterModel: function(models) {
     if (models.key.get('isLocked')) {
-      return Ember.$.getJSON(formatUrl('/v1/session/info/' + models.key.Session, models.dc, models.token)).then(function(data) {
+      return Ember.$.getJSON(formatUrl(consulHost + '/v1/session/info/' + models.key.Session, models.dc, models.token)).then(function(data) {
         models.session = data[0];
         return models;
       });
@@ -212,7 +218,7 @@ App.ServicesRoute = App.BaseRoute.extend({
     var token = App.get('settings.token');
 
     // Return a promise to retrieve all of the services
-    return Ember.$.getJSON(formatUrl('/v1/internal/ui/services', dc, token)).then(function(data) {
+    return Ember.$.getJSON(formatUrl(consulHost + '/v1/internal/ui/services', dc, token)).then(function(data) {
       var objs = [];
       data.map(function(obj){
        objs.push(App.Service.create(obj));
@@ -233,7 +239,7 @@ App.ServicesShowRoute = App.BaseRoute.extend({
 
     // Here we just use the built-in health endpoint, as it gives us everything
     // we need.
-    return Ember.$.getJSON(formatUrl('/v1/health/service/' + params.name, dc, token)).then(function(data) {
+    return Ember.$.getJSON(formatUrl(consulHost + '/v1/health/service/' + params.name, dc, token)).then(function(data) {
       var objs = [];
       data.map(function(obj){
        objs.push(App.Node.create(obj));
@@ -244,7 +250,9 @@ App.ServicesShowRoute = App.BaseRoute.extend({
   setupController: function(controller, model) {
     var tags = [];
     model.map(function(obj){
-      tags = tags.concat(obj.Service.Tags);
+      if (obj.Service.Tags !== null) {
+        tags = tags.concat(obj.Service.Tags);
+      }
     });
 
     tags = tags.filter(function(n){ return n !== undefined; });
@@ -255,19 +263,83 @@ App.ServicesShowRoute = App.BaseRoute.extend({
   }
 });
 
+function distance(a, b) {
+    a = a.Coord;
+    b = b.Coord;
+    var sum = 0;
+    for (var i = 0; i < a.Vec.length; i++) {
+        var diff = a.Vec[i] - b.Vec[i];
+        sum += diff * diff;
+    }
+    var rtt = Math.sqrt(sum) + a.Height + b.Height;
+
+    var adjusted = rtt + a.Adjustment + b.Adjustment;
+    if (adjusted > 0.0) {
+        rtt = adjusted;
+    }
+
+    return Math.round(rtt * 100000.0) / 100.0;
+}
+
 App.NodesShowRoute = App.BaseRoute.extend({
   model: function(params) {
-    var dc = this.modelFor('dc').dc;
+    var dc = this.modelFor('dc');
     var token = App.get('settings.token');
 
-    // Return a promise hash of the node and nodes
+    var min = 999999999;
+    var max = -999999999;
+    var sum = 0;
+    var distances = [];
+    dc.coordinates.forEach(function (node) {
+      if (params.name == node.Node) {
+        var segment = node.Segment;
+        dc.coordinates.forEach(function (other) {
+          if (node.Node != other.Node && other.Segment == segment) {
+            var dist = distance(node, other);
+            distances.push({ node: other.Node, distance: dist, segment: segment });
+            sum += dist;
+            if (dist < min) {
+              min = dist;
+            }
+            if (dist > max) {
+              max = dist;
+            }
+          }
+        });
+        distances.sort(function (a, b) {
+          return a.distance - b.distance;
+        });
+      }
+    });
+    var n = distances.length;
+    var halfN = Math.floor(n / 2);
+    var median;
+
+    if (n > 0) {
+      if (n % 2) {
+        // odd
+        median = distances[halfN].distance;
+      } else {
+        median = (distances[halfN - 1].distance + distances[halfN].distance) / 2;
+      }
+    } else {
+      median = 0;
+      min = 0;
+      max = 0;
+    }
+
+    // Return a promise hash of the node
     return Ember.RSVP.hash({
-      dc: dc,
+      dc: dc.dc,
       token: token,
-      node: Ember.$.getJSON(formatUrl('/v1/internal/ui/node/' + params.name, dc, token)).then(function(data) {
-        return App.Node.create(data);
-      }),
-      nodes: Ember.$.getJSON(formatUrl('/v1/internal/ui/node/' + params.name, dc, token)).then(function(data) {
+      tomography: {
+        distances: distances,
+        n: distances.length,
+        min: parseInt(min * 100) / 100,
+        median: parseInt(median * 100) / 100,
+        max: parseInt(max * 100) / 100
+      },
+      node: Ember.$.getJSON(formatUrl(consulHost + '/v1/internal/ui/node/' + params.name, dc.dc, token)).then(function(data) {
         return App.Node.create(data);
       })
     });
@@ -275,7 +347,7 @@ App.NodesShowRoute = App.BaseRoute.extend({
 
   // Load the sessions for the node
   afterModel: function(models) {
-    return Ember.$.getJSON(formatUrl('/v1/session/node/' + models.node.Node, models.dc, models.token)).then(function(data) {
+    return Ember.$.getJSON(formatUrl(consulHost + '/v1/session/node/' + models.node.Node, models.dc, models.token)).then(function(data) {
       models.sessions = data;
       return models;
     });
@@ -284,12 +356,7 @@ App.NodesShowRoute = App.BaseRoute.extend({
   setupController: function(controller, models) {
       controller.set('content', models.node);
       controller.set('sessions', models.sessions);
-      //
-      // Since we have 2 column layout, we need to also display the
-      // list of nodes on the left. Hence setting the attribute
-      // {{nodes}} on the controller.
-      //
-      controller.set('nodes', models.nodes);
+      controller.set('tomography', models.tomography);
   }
 });
 
@@ -299,7 +366,7 @@ App.NodesRoute = App.BaseRoute.extend({
     var token = App.get('settings.token');
 
     // Return a promise containing the nodes
-    return Ember.$.getJSON(formatUrl('/v1/internal/ui/nodes', dc, token)).then(function(data) {
+    return Ember.$.getJSON(formatUrl(consulHost + '/v1/internal/ui/nodes', dc, token)).then(function(data) {
       var objs = [];
       data.map(function(obj){
        objs.push(App.Node.create(obj));
@@ -318,7 +385,7 @@ App.AclsRoute = App.BaseRoute.extend({
     var dc = this.modelFor('dc').dc;
     var token = App.get('settings.token');
     // Return a promise containing the ACLS
-    return Ember.$.getJSON(formatUrl('/v1/acl/list', dc, token)).then(function(data) {
+    return Ember.$.getJSON(formatUrl(consulHost + '/v1/acl/list', dc, token)).then(function(data) {
       var objs = [];
       data.map(function(obj){
         if (obj.ID === "anonymous") {
@@ -356,10 +423,10 @@ App.AclsShowRoute = App.BaseRoute.extend({
     var dc = this.modelFor('dc').dc;
     var token = App.get('settings.token');
 
-    // Return a promise hash of the node and nodes
+    // Return a promise hash of the ACLs
     return Ember.RSVP.hash({
       dc: dc,
-      acl: Ember.$.getJSON(formatUrl('/v1/acl/info/'+ params.id, dc, token)).then(function(data) {
+      acl: Ember.$.getJSON(formatUrl(consulHost + '/v1/acl/info/'+ params.id, dc, token)).then(function(data) {
         return App.Acl.create(data[0]);
       })
     });
@@ -379,6 +446,9 @@ App.SettingsRoute = App.BaseRoute.extend({
 
 // Adds any global parameters we need to set to a url/path
 function formatUrl(url, dc, token) {
+  if (token == null) {
+    token = "";
+  }
   if (url.indexOf("?") > 0) {
     // If our url has existing params
     url = url + "&dc=" + dc;

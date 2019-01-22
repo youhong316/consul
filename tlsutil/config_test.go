@@ -6,9 +6,12 @@ import (
 	"io"
 	"io/ioutil"
 	"net"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/yamux"
+	"github.com/stretchr/testify/require"
 )
 
 func TestConfig_AppendCA_None(t *testing.T) {
@@ -34,6 +37,20 @@ func TestConfig_CACertificate_Valid(t *testing.T) {
 	}
 	if len(pool.Subjects()) == 0 {
 		t.Fatalf("expected cert")
+	}
+}
+
+func TestConfig_CAPath_Valid(t *testing.T) {
+	conf := &Config{
+		CAPath: "../test/ca_path",
+	}
+
+	tlsConf, err := conf.IncomingTLSConfig()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if len(tlsConf.ClientCAs.Subjects()) != 2 {
+		t.Fatalf("expected certs")
 	}
 }
 
@@ -111,6 +128,23 @@ func TestConfig_OutgoingTLS_VerifyOutgoing(t *testing.T) {
 	}
 }
 
+func TestConfig_SkipBuiltinVerify(t *testing.T) {
+	type variant struct {
+		config Config
+		result bool
+	}
+	table := []variant{
+		variant{Config{ServerName: "", VerifyServerHostname: true}, false},
+		variant{Config{ServerName: "", VerifyServerHostname: false}, true},
+		variant{Config{ServerName: "consul", VerifyServerHostname: true}, false},
+		variant{Config{ServerName: "consul", VerifyServerHostname: false}, false},
+	}
+
+	for _, v := range table {
+		require.Equal(t, v.result, v.config.skipBuiltinVerify())
+	}
+}
+
 func TestConfig_OutgoingTLS_ServerName(t *testing.T) {
 	conf := &Config{
 		VerifyOutgoing: true,
@@ -137,6 +171,7 @@ func TestConfig_OutgoingTLS_ServerName(t *testing.T) {
 
 func TestConfig_OutgoingTLS_VerifyHostname(t *testing.T) {
 	conf := &Config{
+		VerifyOutgoing:       true,
 		VerifyServerHostname: true,
 		CAFile:               "../test/ca/root.cer",
 	}
@@ -149,9 +184,6 @@ func TestConfig_OutgoingTLS_VerifyHostname(t *testing.T) {
 	}
 	if len(tls.RootCAs.Subjects()) != 1 {
 		t.Fatalf("expect root cert")
-	}
-	if tls.ServerName != "VerifyServerHostname" {
-		t.Fatalf("expect server name")
 	}
 	if tls.InsecureSkipVerify {
 		t.Fatalf("should not skip built-in verification")
@@ -183,6 +215,27 @@ func TestConfig_OutgoingTLS_WithKeyPair(t *testing.T) {
 	}
 }
 
+func TestConfig_OutgoingTLS_TLSMinVersion(t *testing.T) {
+	tlsVersions := []string{"tls10", "tls11", "tls12"}
+	for _, version := range tlsVersions {
+		conf := &Config{
+			VerifyOutgoing: true,
+			CAFile:         "../test/ca/root.cer",
+			TLSMinVersion:  version,
+		}
+		tls, err := conf.OutgoingTLSConfig()
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if tls == nil {
+			t.Fatalf("expected config")
+		}
+		if tls.MinVersion != TLSLookup[version] {
+			t.Fatalf("expected tls min version: %v, %v", tls.MinVersion, TLSLookup[version])
+		}
+	}
+}
+
 func startTLSServer(config *Config) (net.Conn, chan error) {
 	errc := make(chan error, 1)
 
@@ -207,6 +260,7 @@ func startTLSServer(config *Config) (net.Conn, chan error) {
 			errc <- err
 		}
 		close(errc)
+
 		// Because net.Pipe() is unbuffered, if both sides
 		// Close() simultaneously, we will deadlock as they
 		// both send an alert and then block. So we make the
@@ -225,6 +279,7 @@ func TestConfig_outgoingWrapper_OK(t *testing.T) {
 		CertFile:             "../test/hostname/Alice.crt",
 		KeyFile:              "../test/hostname/Alice.key",
 		VerifyServerHostname: true,
+		VerifyOutgoing:       true,
 		Domain:               "consul",
 	}
 
@@ -259,6 +314,7 @@ func TestConfig_outgoingWrapper_BadDC(t *testing.T) {
 		CertFile:             "../test/hostname/Alice.crt",
 		KeyFile:              "../test/hostname/Alice.key",
 		VerifyServerHostname: true,
+		VerifyOutgoing:       true,
 		Domain:               "consul",
 	}
 
@@ -276,12 +332,11 @@ func TestConfig_outgoingWrapper_BadDC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("wrapTLS err: %v", err)
 	}
-	defer tlsClient.Close()
 	err = tlsClient.(*tls.Conn).Handshake()
-
 	if _, ok := err.(x509.HostnameError); !ok {
 		t.Fatalf("should get hostname err: %v", err)
 	}
+	tlsClient.Close()
 
 	<-errc
 }
@@ -292,6 +347,7 @@ func TestConfig_outgoingWrapper_BadCert(t *testing.T) {
 		CertFile:             "../test/key/ourdomain.cer",
 		KeyFile:              "../test/key/ourdomain.key",
 		VerifyServerHostname: true,
+		VerifyOutgoing:       true,
 		Domain:               "consul",
 	}
 
@@ -309,12 +365,11 @@ func TestConfig_outgoingWrapper_BadCert(t *testing.T) {
 	if err != nil {
 		t.Fatalf("wrapTLS err: %v", err)
 	}
-	defer tlsClient.Close()
 	err = tlsClient.(*tls.Conn).Handshake()
-
 	if _, ok := err.(x509.HostnameError); !ok {
 		t.Fatalf("should get hostname err: %v", err)
 	}
+	tlsClient.Close()
 
 	<-errc
 }
@@ -337,7 +392,7 @@ func TestConfig_wrapTLS_OK(t *testing.T) {
 		t.Fatalf("OutgoingTLSConfig err: %v", err)
 	}
 
-	tlsClient, err := WrapTLSClient(client, clientConfig)
+	tlsClient, err := config.wrapTLSClient(client, clientConfig)
 	if err != nil {
 		t.Fatalf("wrapTLS err: %v", err)
 	} else {
@@ -370,7 +425,7 @@ func TestConfig_wrapTLS_BadCert(t *testing.T) {
 		t.Fatalf("OutgoingTLSConfig err: %v", err)
 	}
 
-	tlsClient, err := WrapTLSClient(client, clientTLSConfig)
+	tlsClient, err := clientConfig.wrapTLSClient(client, clientTLSConfig)
 	if err == nil {
 		t.Fatalf("wrapTLS no err")
 	}
@@ -449,5 +504,91 @@ func TestConfig_IncomingTLS_NoVerify(t *testing.T) {
 	}
 	if len(tlsC.Certificates) != 0 {
 		t.Fatalf("unexpected client cert")
+	}
+}
+
+func TestConfig_IncomingTLS_TLSMinVersion(t *testing.T) {
+	tlsVersions := []string{"tls10", "tls11", "tls12"}
+	for _, version := range tlsVersions {
+		conf := &Config{
+			VerifyIncoming: true,
+			CAFile:         "../test/ca/root.cer",
+			CertFile:       "../test/key/ourdomain.cer",
+			KeyFile:        "../test/key/ourdomain.key",
+			TLSMinVersion:  version,
+		}
+		tls, err := conf.IncomingTLSConfig()
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if tls == nil {
+			t.Fatalf("expected config")
+		}
+		if tls.MinVersion != TLSLookup[version] {
+			t.Fatalf("expected tls min version: %v, %v", tls.MinVersion, TLSLookup[version])
+		}
+	}
+}
+
+func TestConfig_ParseCiphers(t *testing.T) {
+	testOk := strings.Join([]string{
+		"TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305",
+		"TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305",
+		"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+		"TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+		"TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+		"TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+		"TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+		"TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
+		"TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
+		"TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA",
+		"TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+		"TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
+		"TLS_RSA_WITH_AES_128_GCM_SHA256",
+		"TLS_RSA_WITH_AES_256_GCM_SHA384",
+		"TLS_RSA_WITH_AES_128_CBC_SHA256",
+		"TLS_RSA_WITH_AES_128_CBC_SHA",
+		"TLS_RSA_WITH_AES_256_CBC_SHA",
+		"TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA",
+		"TLS_RSA_WITH_3DES_EDE_CBC_SHA",
+		"TLS_RSA_WITH_RC4_128_SHA",
+		"TLS_ECDHE_RSA_WITH_RC4_128_SHA",
+		"TLS_ECDHE_ECDSA_WITH_RC4_128_SHA",
+	}, ",")
+	ciphers := []uint16{
+		tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+		tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+		tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+		tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+		tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_RSA_WITH_AES_128_CBC_SHA256,
+		tls.TLS_RSA_WITH_AES_128_CBC_SHA,
+		tls.TLS_RSA_WITH_AES_256_CBC_SHA,
+		tls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,
+		tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA,
+		tls.TLS_RSA_WITH_RC4_128_SHA,
+		tls.TLS_ECDHE_RSA_WITH_RC4_128_SHA,
+		tls.TLS_ECDHE_ECDSA_WITH_RC4_128_SHA,
+	}
+	v, err := ParseCiphers(testOk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := v, ciphers; !reflect.DeepEqual(got, want) {
+		t.Fatalf("got ciphers %#v want %#v", got, want)
+	}
+
+	testBad := "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,cipherX"
+	if _, err := ParseCiphers(testBad); err == nil {
+		t.Fatal("should fail on unsupported cipherX")
 	}
 }

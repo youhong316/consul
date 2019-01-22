@@ -8,6 +8,8 @@ import (
 	"net"
 	"strings"
 	"time"
+
+	"github.com/hashicorp/go-rootcerts"
 )
 
 // DCWrapper is a function that is used to wrap a non-TLS connection
@@ -18,6 +20,13 @@ type DCWrapper func(dc string, conn net.Conn) (net.Conn, error)
 // Wrapper is a variant of DCWrapper, where the DC is provided as
 // a constant value. This is usually done by currying DCWrapper.
 type Wrapper func(conn net.Conn) (net.Conn, error)
+
+// TLSLookup maps the tls_min_version configuration to the internal value
+var TLSLookup = map[string]uint16{
+	"tls10": tls.VersionTLS10,
+	"tls11": tls.VersionTLS11,
+	"tls12": tls.VersionTLS12,
+}
 
 // Config used to create tls.Config
 type Config struct {
@@ -40,9 +49,16 @@ type Config struct {
 	// existing clients.
 	VerifyServerHostname bool
 
+	// UseTLS is used to enable outgoing TLS connections to Consul servers.
+	UseTLS bool
+
 	// CAFile is a path to a certificate authority file. This is used with VerifyIncoming
 	// or VerifyOutgoing to verify the TLS connection.
 	CAFile string
+
+	// CAPath is a path to a directory containing certificate authority files. This is used
+	// with VerifyIncoming or VerifyOutgoing to verify the TLS connection.
+	CAPath string
 
 	// CertFile is used to provide a TLS certificate that is used for serving TLS connections.
 	// Must be provided to serve TLS connections.
@@ -61,6 +77,16 @@ type Config struct {
 
 	// Domain is the Consul TLD being used. Defaults to "consul."
 	Domain string
+
+	// TLSMinVersion is the minimum accepted TLS version that can be used.
+	TLSMinVersion string
+
+	// CipherSuites is the list of TLS cipher suites to use.
+	CipherSuites []uint16
+
+	// PreferServerCipherSuites specifies whether to prefer the server's ciphersuite
+	// over the client ciphersuites.
+	PreferServerCipherSuites bool
 }
 
 // AppendCA opens and parses the CA file and adds the certificates to
@@ -95,40 +121,41 @@ func (c *Config) KeyPair() (*tls.Certificate, error) {
 	return &cert, err
 }
 
+func (c *Config) skipBuiltinVerify() bool {
+	return c.VerifyServerHostname == false && c.ServerName == ""
+}
+
 // OutgoingTLSConfig generates a TLS configuration for outgoing
 // requests. It will return a nil config if this configuration should
 // not use TLS for outgoing connections.
 func (c *Config) OutgoingTLSConfig() (*tls.Config, error) {
-	// If VerifyServerHostname is true, that implies VerifyOutgoing
-	if c.VerifyServerHostname {
-		c.VerifyOutgoing = true
-	}
-	if !c.VerifyOutgoing {
+	if !c.UseTLS && !c.VerifyOutgoing {
 		return nil, nil
 	}
 	// Create the tlsConfig
 	tlsConfig := &tls.Config{
 		RootCAs:            x509.NewCertPool(),
-		InsecureSkipVerify: true,
+		InsecureSkipVerify: c.skipBuiltinVerify(),
+		ServerName:         c.ServerName,
 	}
-	if c.ServerName != "" {
-		tlsConfig.ServerName = c.ServerName
-		tlsConfig.InsecureSkipVerify = false
+	if len(c.CipherSuites) != 0 {
+		tlsConfig.CipherSuites = c.CipherSuites
 	}
-	if c.VerifyServerHostname {
-		// ServerName is filled in dynamically based on the target DC
-		tlsConfig.ServerName = "VerifyServerHostname"
-		tlsConfig.InsecureSkipVerify = false
+	if c.PreferServerCipherSuites {
+		tlsConfig.PreferServerCipherSuites = true
 	}
 
 	// Ensure we have a CA if VerifyOutgoing is set
-	if c.VerifyOutgoing && c.CAFile == "" {
+	if c.VerifyOutgoing && c.CAFile == "" && c.CAPath == "" {
 		return nil, fmt.Errorf("VerifyOutgoing set, and no CA certificate provided!")
 	}
 
-	// Parse the CA cert if any
-	err := c.AppendCA(tlsConfig.RootCAs)
-	if err != nil {
+	// Parse the CA certs if any
+	rootConfig := &rootcerts.Config{
+		CAFile: c.CAFile,
+		CAPath: c.CAPath,
+	}
+	if err := rootcerts.ConfigureTLS(tlsConfig, rootConfig); err != nil {
 		return nil, err
 	}
 
@@ -138,6 +165,15 @@ func (c *Config) OutgoingTLSConfig() (*tls.Config, error) {
 		return nil, err
 	} else if cert != nil {
 		tlsConfig.Certificates = []tls.Certificate{*cert}
+	}
+
+	// Check if a minimum TLS version was set
+	if c.TLSMinVersion != "" {
+		tlsvers, ok := TLSLookup[c.TLSMinVersion]
+		if !ok {
+			return nil, fmt.Errorf("TLSMinVersion: value %s not supported, please specify one of [tls10,tls11,tls12]", c.TLSMinVersion)
+		}
+		tlsConfig.MinVersion = tlsvers
 	}
 
 	return tlsConfig, nil
@@ -158,23 +194,18 @@ func (c *Config) OutgoingTLSWrapper() (DCWrapper, error) {
 		return nil, nil
 	}
 
-	// Strip the trailing '.' from the domain if any
-	domain := strings.TrimSuffix(c.Domain, ".")
-
 	// Generate the wrapper based on hostname verification
-	if c.VerifyServerHostname {
-		wrapper := func(dc string, conn net.Conn) (net.Conn, error) {
-			conf := *tlsConfig
-			conf.ServerName = "server." + dc + "." + domain
-			return WrapTLSClient(conn, &conf)
+	wrapper := func(dc string, conn net.Conn) (net.Conn, error) {
+		if c.VerifyServerHostname {
+			// Strip the trailing '.' from the domain if any
+			domain := strings.TrimSuffix(c.Domain, ".")
+			tlsConfig = tlsConfig.Clone()
+			tlsConfig.ServerName = "server." + dc + "." + domain
 		}
-		return wrapper, nil
-	} else {
-		wrapper := func(dc string, c net.Conn) (net.Conn, error) {
-			return WrapTLSClient(c, tlsConfig)
-		}
-		return wrapper, nil
+		return c.wrapTLSClient(conn, tlsConfig)
 	}
+
+	return wrapper, nil
 }
 
 // SpecificDC is used to invoke a static datacenter
@@ -198,7 +229,7 @@ func SpecificDC(dc string, tlsWrap DCWrapper) Wrapper {
 // node names, we don't verify the certificate DNS names. Since go 1.3
 // no longer supports this mode of operation, we have to do it
 // manually.
-func WrapTLSClient(conn net.Conn, tlsConfig *tls.Config) (net.Conn, error) {
+func (c *Config) wrapTLSClient(conn net.Conn, tlsConfig *tls.Config) (net.Conn, error) {
 	var err error
 	var tlsConn *tls.Conn
 
@@ -207,6 +238,11 @@ func WrapTLSClient(conn net.Conn, tlsConfig *tls.Config) (net.Conn, error) {
 	// If crypto/tls is doing verification, there's no need to do
 	// our own.
 	if tlsConfig.InsecureSkipVerify == false {
+		return tlsConn, nil
+	}
+
+	// If verification is not turned on, don't do it.
+	if !c.VerifyOutgoing {
 		return tlsConn, nil
 	}
 
@@ -253,10 +289,27 @@ func (c *Config) IncomingTLSConfig() (*tls.Config, error) {
 		tlsConfig.ServerName = c.NodeName
 	}
 
-	// Parse the CA cert if any
-	err := c.AppendCA(tlsConfig.ClientCAs)
-	if err != nil {
-		return nil, err
+	// Set the cipher suites
+	if len(c.CipherSuites) != 0 {
+		tlsConfig.CipherSuites = c.CipherSuites
+	}
+	if c.PreferServerCipherSuites {
+		tlsConfig.PreferServerCipherSuites = true
+	}
+
+	// Parse the CA certs if any
+	if c.CAFile != "" {
+		pool, err := rootcerts.LoadCAFile(c.CAFile)
+		if err != nil {
+			return nil, err
+		}
+		tlsConfig.ClientCAs = pool
+	} else if c.CAPath != "" {
+		pool, err := rootcerts.LoadCAPath(c.CAPath)
+		if err != nil {
+			return nil, err
+		}
+		tlsConfig.ClientCAs = pool
 	}
 
 	// Add cert/key
@@ -270,12 +323,66 @@ func (c *Config) IncomingTLSConfig() (*tls.Config, error) {
 	// Check if we require verification
 	if c.VerifyIncoming {
 		tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
-		if c.CAFile == "" {
+		if c.CAFile == "" && c.CAPath == "" {
 			return nil, fmt.Errorf("VerifyIncoming set, and no CA certificate provided!")
 		}
 		if cert == nil {
 			return nil, fmt.Errorf("VerifyIncoming set, and no Cert/Key pair provided!")
 		}
 	}
+
+	// Check if a minimum TLS version was set
+	if c.TLSMinVersion != "" {
+		tlsvers, ok := TLSLookup[c.TLSMinVersion]
+		if !ok {
+			return nil, fmt.Errorf("TLSMinVersion: value %s not supported, please specify one of [tls10,tls11,tls12]", c.TLSMinVersion)
+		}
+		tlsConfig.MinVersion = tlsvers
+	}
 	return tlsConfig, nil
+}
+
+// ParseCiphers parse ciphersuites from the comma-separated string into recognized slice
+func ParseCiphers(cipherStr string) ([]uint16, error) {
+	suites := []uint16{}
+
+	cipherStr = strings.TrimSpace(cipherStr)
+	if cipherStr == "" {
+		return []uint16{}, nil
+	}
+	ciphers := strings.Split(cipherStr, ",")
+
+	cipherMap := map[string]uint16{
+		"TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305":    tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+		"TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305":  tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+		"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256":   tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		"TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256": tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		"TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384":   tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		"TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384": tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		"TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256":   tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+		"TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA":      tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+		"TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256": tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
+		"TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA":    tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+		"TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA":      tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+		"TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA":    tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+		"TLS_RSA_WITH_AES_128_GCM_SHA256":         tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+		"TLS_RSA_WITH_AES_256_GCM_SHA384":         tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+		"TLS_RSA_WITH_AES_128_CBC_SHA256":         tls.TLS_RSA_WITH_AES_128_CBC_SHA256,
+		"TLS_RSA_WITH_AES_128_CBC_SHA":            tls.TLS_RSA_WITH_AES_128_CBC_SHA,
+		"TLS_RSA_WITH_AES_256_CBC_SHA":            tls.TLS_RSA_WITH_AES_256_CBC_SHA,
+		"TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA":     tls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,
+		"TLS_RSA_WITH_3DES_EDE_CBC_SHA":           tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA,
+		"TLS_RSA_WITH_RC4_128_SHA":                tls.TLS_RSA_WITH_RC4_128_SHA,
+		"TLS_ECDHE_RSA_WITH_RC4_128_SHA":          tls.TLS_ECDHE_RSA_WITH_RC4_128_SHA,
+		"TLS_ECDHE_ECDSA_WITH_RC4_128_SHA":        tls.TLS_ECDHE_ECDSA_WITH_RC4_128_SHA,
+	}
+	for _, cipher := range ciphers {
+		if v, ok := cipherMap[cipher]; ok {
+			suites = append(suites, v)
+		} else {
+			return suites, fmt.Errorf("unsupported cipher %q", cipher)
+		}
+	}
+
+	return suites, nil
 }

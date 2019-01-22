@@ -54,17 +54,13 @@ App.Service = Ember.Object.extend({
   // Boolean of whether or not there are failing checks in the service.
   // This is used to set color backgrounds and so on.
   //
-  hasFailingChecks: function() {
-    return (this.get('failingChecks') > 0);
-  }.property('Checks'),
+  hasFailingChecks: Ember.computed.gt('failingChecks', 0),
 
   //
   // Key used for filtering through an array of this model, i.e s
   // searching
   //
-  filterKey: function() {
-    return this.get('Name');
-  }.property('Name'),
+  filterKey: Ember.computed.alias('Name'),
 });
 
 //
@@ -75,10 +71,13 @@ App.Node = Ember.Object.extend({
   // The number of failing checks within the service.
   //
   failingChecks: function() {
-    var checks = this.get('Checks');
-    // We view both warning and critical as failing
-    return (checks.filterBy('Status', 'critical').get('length') +
-      checks.filterBy('Status', 'warning').get('length'));
+    return this.get('Checks').reduce(function(sum, check) {
+      var status = Ember.get(check, 'Status');
+      // We view both warning and critical as failing
+      return (status === 'critical' || status === 'warning') ?
+        sum + 1 :
+        sum;
+    }, 0);
   }.property('Checks'),
 
   //
@@ -104,26 +103,16 @@ App.Node = Ember.Object.extend({
   // Boolean of whether or not there are failing checks in the service.
   // This is used to set color backgrounds and so on.
   //
-  hasFailingChecks: function() {
-    return (this.get('failingChecks') > 0);
-  }.property('Checks'),
+  hasFailingChecks: Ember.computed.gt('failingChecks', 0),
 
   //
   // The number of services on the node
   //
-  numServices: function() {
-    return (this.get('Services').length);
-  }.property('Services'),
-  // The number of services on the node
-  //
+  numServices: Ember.computed.alias('Services.length'),
 
-  services: function() {
-    return (this.get('Services'));
-  }.property('Services'),
+  services: Ember.computed.alias('Services'),
 
-  filterKey: function() {
-    return this.get('Node');
-  }.property('Node')
+  filterKey: Ember.computed.alias('Node')
 });
 
 
@@ -131,15 +120,39 @@ App.Node = Ember.Object.extend({
 // A key/value object
 //
 App.Key = Ember.Object.extend(Ember.Validations.Mixin, {
-  // Validates using the Ember.Valdiations library
+  // Validates using the Ember.Validations library
   validations: {
     Key: { presence: true }
   },
 
+  // Boolean if field should validate JSON
+  validateJson: false,
   // Boolean if the key is valid
   keyValid: Ember.computed.empty('errors.Key'),
   // Boolean if the value is valid
   valueValid: Ember.computed.empty('errors.Value'),
+
+  // Escape any user-entered parts that aren't URL-safe, but put slashes back since
+  // they are common in keys, and the UI lets users make "folders" by simply adding
+  // them to keys.
+  Key: function(key, value) {
+    // setter
+    if (arguments.length > 1) {
+      clean = value
+      try {
+        clean = decodeURIComponent(clean);
+      } catch (e) {
+        // If they've got something that's not valid URL syntax then keep going;
+        // this means that at worst we might end up double escaping some things.
+      }
+      clean = encodeURIComponent(clean).replace(/%2F/g, "/")
+      this.set('cleanKey', clean);
+      return clean;
+    }
+
+    // getter
+    return this.get('cleanKey')
+  }.property('Key'),
 
   // The key with the parent removed.
   // This is only for display purposes, and used for
@@ -202,6 +215,24 @@ App.Key = Ember.Object.extend(Ember.Validations.Mixin, {
     return (this.get('Value').fromBase64());
   }.property('Value'),
 
+  // Check if JSON is valid by attempting a native JSON parse
+  isValidJson: function() {
+    var value;
+
+    try {
+      window.atob(this.get('Value'));
+      value = this.get('valueDecoded');
+    } catch (e) {
+      value = this.get('Value');
+    }
+
+    try {
+      JSON.parse(value);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }.property('Value'),
 
   // An array of the key broken up by the /
   keyParts: function() {
@@ -223,7 +254,7 @@ App.Key = Ember.Object.extend(Ember.Validations.Mixin, {
     var parts = this.get('keyParts').toArray();
 
     // Remove the last item, essentially going up a level
-    // in hiearchy
+    // in hierarchy
     parts.pop();
 
     return parts.join("/") + "/";
@@ -281,5 +312,3 @@ App.Settings = Ember.Object.extend({
     this.endPropertyChanges();
   }
 });
-
-

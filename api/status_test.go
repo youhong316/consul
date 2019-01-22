@@ -4,10 +4,11 @@ import (
 	"testing"
 )
 
-func TestStatusLeader(t *testing.T) {
+func TestAPI_StatusLeader(t *testing.T) {
 	t.Parallel()
 	c, s := makeClient(t)
 	defer s.Stop()
+	s.WaitForSerfCheck(t)
 
 	status := c.Status()
 
@@ -20,10 +21,11 @@ func TestStatusLeader(t *testing.T) {
 	}
 }
 
-func TestStatusPeers(t *testing.T) {
+func TestAPI_StatusPeers(t *testing.T) {
 	t.Parallel()
 	c, s := makeClient(t)
 	defer s.Stop()
+	s.WaitForSerfCheck(t)
 
 	status := c.Status()
 

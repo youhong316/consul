@@ -1,72 +1,66 @@
 # -*- mode: ruby -*-
 # vi: set ft=ruby :
+#
 
-# Vagrantfile API/syntax version. Don't touch unless you know what you're doing!
-VAGRANTFILE_API_VERSION = '2'
+LINUX_BASE_BOX = "bento/ubuntu-16.04"
 
-@script = <<SCRIPT
-SRCROOT="/opt/go"
-SRCPATH="/opt/gopath"
+Vagrant.configure(2) do |config|
+	config.vm.define "linux", autostart: true, primary: true do |vmCfg|
+		vmCfg.vm.box = LINUX_BASE_BOX
+		vmCfg.vm.hostname = "linux"
+		vmCfg = configureProviders vmCfg,
+			cpus: suggestedCPUCores()
 
-# Get the ARCH
-ARCH=`uname -m | sed 's|i686|386|' | sed 's|x86_64|amd64|'`
+		vmCfg = configureLinuxProvisioners(vmCfg)
 
-# Install Go
-sudo apt-get update
-sudo apt-get install -y build-essential git-core
+		vmCfg.vm.synced_folder '.',
+			'/opt/gopath/src/github.com/hashicorp/consul'
 
-# Install Go
-cd /tmp
-wget --quiet --no-check-certificate https://storage.googleapis.com/golang/go1.4.2.linux-${ARCH}.tar.gz
-tar -xvf go1.4.2.linux-${ARCH}.tar.gz
-sudo mv go $SRCROOT
-sudo chmod 775 $SRCROOT
-sudo chown vagrant:vagrant $SRCROOT
+        vmCfg.vm.network "forwarded_port", guest: 8500, host: 8500, auto_correct: true
+	end
+end
 
-# Setup the GOPATH; even though the shared folder spec gives the consul
-# directory the right user/group, we need to set it properly on the
-# parent path to allow subsequent "go get" commands to work. We can't do
-# normal -R here because VMWare complains if we try to update the shared
-# folder permissions, so we just update the folders that matter.
-sudo mkdir -p $SRCPATH
-find /opt/gopath -type d -maxdepth 3 | xargs sudo chown vagrant:vagrant
+def configureLinuxProvisioners(vmCfg)
+	vmCfg.vm.provision "shell",
+		privileged: true,
+		inline: 'rm -f /home/vagrant/linux.iso'
 
-cat <<EOF >/tmp/gopath.sh
-export GOPATH="$SRCPATH"
-export GOROOT="$SRCROOT"
-export PATH="$SRCROOT/bin:$SRCPATH/bin:\$PATH"
-EOF
-sudo mv /tmp/gopath.sh /etc/profile.d/gopath.sh
-sudo chmod 0755 /etc/profile.d/gopath.sh
-source /etc/profile.d/gopath.sh
+	vmCfg.vm.provision "shell",
+		privileged: true,
+		path: './scripts/vagrant-linux-priv-go.sh'
 
-# Install go tools
-go get golang.org/x/tools/cmd/cover
-SCRIPT
+	return vmCfg
+end
 
-Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
-  config.vm.provision 'shell', inline: @script, privileged: false
-  config.vm.synced_folder '.', '/opt/gopath/src/github.com/hashicorp/consul'
+def configureProviders(vmCfg, cpus: "2", memory: "2048")
+	vmCfg.vm.provider "virtualbox" do |v|
+		v.memory = memory
+		v.cpus = cpus
+	end
 
-  %w[vmware_fusion vmware_workstation].each do |p|
-    config.vm.provider p do |v|
-      v.vmx['memsize'] = '2048'
-      v.vmx['numvcpus'] = '2'
-      v.vmx['cpuid.coresPerSocket'] = '1'
-    end
-  end
+	["vmware_fusion", "vmware_workstation"].each do |p|
+		vmCfg.vm.provider p do |v|
+			v.enable_vmrun_ip_lookup = false
+			v.vmx["memsize"] = memory
+			v.vmx["numvcpus"] = cpus
+		end
+	end
 
-  # Note we use older boxes here to avoid glibc version check problems with
-  # the built C dependencies.
-  config.vm.define '64bit' do |n1|
-    n1.vm.box = 'chef/ubuntu-10.04'
-  end
+	vmCfg.vm.provider "virtualbox" do |v|
+		v.memory = memory
+		v.cpus = cpus
+	end
 
-  config.vm.define '32bit' do |n2|
-    n2.vm.box = 'chef/ubuntu-10.04-i386'
-  end
+	return vmCfg
+end
 
-  config.push.define "www", strategy: "local-exec" do |push|
-    push.script = "scripts/website_push.sh"
-  end
+def suggestedCPUCores()
+	case RbConfig::CONFIG['host_os']
+	when /darwin/
+		Integer(`sysctl -n hw.ncpu`) / 2
+	when /linux/
+		Integer(`cat /proc/cpuinfo | grep processor | wc -l`) / 2
+	else
+		2
+	end
 end

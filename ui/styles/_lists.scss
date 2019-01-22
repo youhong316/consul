@@ -16,7 +16,6 @@
         padding-left: 0px;
         color: $gray;
         font-size: 13px;
-        height: 20px;
     }
 
     .list-group-item-heading {
@@ -116,11 +115,11 @@
 
     &.active {
         @include transition(border-color .1s linear);
-        border-color: $purple;
+        border-color: $pink;
 
         .list-bar, .list-bar-horizontal {
             @include transition(background-color .1s linear);
-            background-color: $purple;
+            background-color: $pink;
         }
     }
 

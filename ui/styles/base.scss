@@ -7,6 +7,7 @@
 @import "lists";
 @import "forms";
 @import "notifications";
+@import "v2-notification";
 
 html, body {
   height: 100%;
@@ -71,9 +72,16 @@ a {
     margin-top: 200px;
 }
 
+.sticky-scroll {
+    top: 15px;
+    position: sticky;
+    position: -webkit-sticky;
+    overflow: scroll;
+}
+
 .row {
     &.colored {
-        background-color: $light-purple;
+        background-color: $light-pink;
     }
 }
 
@@ -82,12 +90,12 @@ a {
 }
 
 
-.bg-purple {
-    background-color: $purple;
+.bg-pink {
+    background-color: $pink;
 }
 
-.bg-light-purple {
-    background-color: $light-purple;
+.bg-light-pink {
+    background-color: $light-pink;
 }
 
 .bg-orange {
@@ -147,4 +155,35 @@ a {
 .do-logo {
   opacity: 0.6;
   margin-top: -3px;
+}
+
+.tomography .background {
+    fill: $gray-background;
+}
+.tomography .axis {
+    fill: none;
+    stroke: $gray-light;
+    stroke-dasharray: 4 4;
+}
+.tomography .border {
+    fill: none;
+    stroke: $gray-darker;
+}
+.tomography .point {
+    stroke: $gray-darker;
+    fill: $green-faded;
+}
+.tomography .lines line {
+    stroke: $red;
+}
+.tomography .lines line:hover {
+    stroke: $gray-darker;
+    stroke-width: 2px;
+}
+.tomography .tick line {
+    stroke: $gray-light;
+}
+.tomography .tick text {
+    font-size: 14px;
+    text-anchor: start;
 }
